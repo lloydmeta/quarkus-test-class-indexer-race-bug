@@ -7,16 +7,18 @@ Minimal Quarkus + Gradle repro for a write/read race in
 ## tl;dr
 
 * `./gradlew clean test -Pforks=1`                     ALWAYS passes (no concurrency, no race)
-* `./gradlew clean test -Pforks=16`                    intermittently fails (observed ~40% local flake on a 12-core Apple Silicon laptop, see CI matrix for `ubuntu-latest` rate)
+* `./gradlew clean test -Pforks=16`                    flaky (observed 9 of 10 runs failing on a 12-core Apple Silicon laptop; see CI matrix for `ubuntu-latest` rate)
 * `./gradlew clean test -Pforks=16 -Pwiden-window`     reliably fails (deterministic widening of the existing race)
 
 The smoking gun is `forks=1` vs `forks>1`: the project itself is thirty-two
 trivial empty `@QuarkusTest` classes spread across eight `@TestProfile`s,
 plus 5000 generated dummy classes whose only role is to bloat the Jandex index
-file (~180 KB) so the truncate-to-flush window is wider in wall-clock time.
-There is nothing in the test code that should care how many JVM forks JUnit
-runs in. The only thing that changes is whether multiple forks share the
-same `build/classes/java/test/test-classes.idx`.
+file (~1.9 MB) so the truncate-to-flush window is wider in wall-clock time.
+The bug exists regardless of suite size; the dummies just make it observable
+in a few runs rather than over weeks of CI. There is nothing in the test code
+that should care how many JVM forks JUnit runs in. The only thing that changes
+is whether multiple forks share the same
+`build/classes/java/test/test-classes.idx`.
 
 ## The bug
 
@@ -36,7 +38,7 @@ several JVMs share one `build/classes/java/test/` directory and they each call
 `writeIndex` once per distinct `@TestProfile` (verified: a `forks=1` run with
 8 profiles emits exactly 8 `writeIndex` calls on `Test worker`; see
 `-Pwiden-window` output, which also reports the resulting index size of
-~180 KB) and `readIndex` once per test class (called from
+~1.9 MB) and `readIndex` once per test class (called from
 [`TestBuildChainFunction.apply`][readIndex-caller] during build chain
 construction, surfaced in the stack trace below).
 
@@ -83,14 +85,25 @@ Caused by: java.lang.IllegalArgumentException: Not a jandex index
 
 ## Why two reproduction modes
 
-On commodity hardware the truncate-to-write window is in the microsecond range
-when the index is small, but it grows with the index size and the contention
-on the test classes directory. Locally on a 12-core Apple Silicon laptop with
-this repo (8 profiles, 32 tests, ~180 KB index) we see ~40% natural fails at
-`-Pforks=16` (2 of 5 runs, both `IllegalArgumentException: Not a jandex index`).
-Because it's still a probabilistic race, this repo also ships an opt-in
-javaagent (`src/widenWindow/`) that produces the same end-state
-deterministically using only `ftruncate` (no explicit byte writes):
+The truncate-to-write window is in the microsecond range when the index is
+small, but it grows roughly linearly with index size. Local sweep on a 12-core
+Apple Silicon laptop, all at `-Pforks=16`, varying `-Pdummies`:
+
+| `-Pdummies` | Index size  | Flake rate     |
+|-------------|-------------|----------------|
+| 0           | 2.8 KB      | 0/5  (0%)      |
+| 500         | 178 KB      | 0/5  (0%)      |
+| 2000        | 740 KB      | 3/5  (60%)     |
+| 5000        | 1.9 MB      | 9/10 (90%)     |
+
+The bug is the same regardless of suite size; the dummies just shift the
+probability from "weeks of CI" to "minutes of laptop time". On suites with
+small index files the natural rate may be effectively zero on commodity
+hardware, which is one reason this kind of bug can sit in production for a
+long time before anyone notices. Because the natural reproduction is still
+probabilistic, this repo also ships an opt-in javaagent (`src/widenWindow/`)
+that produces the same end-state deterministically using only `ftruncate`
+(no explicit byte writes):
 
 * `RandomAccessFile.setLength(0)` truncates the file (same syscall as
   `FileOutputStream(file, false)`).
@@ -132,6 +145,13 @@ and most developer laptops, which widens the truncate-to-flush window past
 the race threshold. The default if `-Pforks` is omitted is
 `gradle.startParameter.maxWorkerCount`, which mirrors how many real projects
 configure it.
+
+`-Pdummies=N` controls how many generated dummy classes are added to the test
+classpath (default 5000) to bloat the Jandex index and shift the natural flake
+rate. See the "Why two reproduction modes" table above for measured rates;
+roughly: index < 200 KB never flakes locally, ~750 KB is ~60%, ~2 MB is ~90%.
+Useful for bisecting "how big does the index need to be before this fires on
+my hardware".
 
 [gh-runners]: https://docs.github.com/en/actions/reference/runners/github-hosted-runners
 
