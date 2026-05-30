@@ -42,6 +42,44 @@ tasks.withType<JavaCompile> {
     options.compilerArgs.add("-parameters")
 }
 
+// Generate a pile of dummy classes whose only purpose is to bloat the Jandex
+// index so that writeIndex's truncate-to-flush window is wider in wall-clock
+// time. Plain POJOs with a handful of methods/fields/annotations each: enough
+// to give Jandex a non-trivial per-class entry without introducing any CDI/ARC
+// machinery that Quarkus would react to.
+val dummyCount = (project.findProperty("dummies") as String?)?.toInt() ?: 500
+
+val generateTestDummies = tasks.register("generateTestDummies") {
+    val outDir = layout.buildDirectory.dir("generated-sources/test-dummies/java/com/beachape/dummies")
+    inputs.property("dummyCount", dummyCount)
+    outputs.dir(layout.buildDirectory.dir("generated-sources/test-dummies/java"))
+    doLast {
+        val dir = outDir.get().asFile
+        dir.mkdirs()
+        for (i in 0 until dummyCount) {
+            val name = "Dummy$i"
+            val sb = StringBuilder()
+            sb.append("package com.beachape.dummies;\n\n")
+            sb.append("@Deprecated\n")
+            sb.append("@SuppressWarnings(\"unused$i\")\n")
+            sb.append("public final class $name {\n")
+            for (f in 0 until 8) {
+                sb.append("    @Deprecated private final int field${f} = $f;\n")
+            }
+            for (m in 0 until 8) {
+                sb.append("    @SuppressWarnings(\"m$m\")\n")
+                sb.append("    @Deprecated\n")
+                sb.append("    public int method${m}(int a, int b) { return a + b + ${m}; }\n")
+            }
+            sb.append("}\n")
+            dir.resolve("$name.java").writeText(sb.toString())
+        }
+    }
+}
+
+sourceSets["test"].java.srcDir(layout.buildDirectory.dir("generated-sources/test-dummies/java"))
+tasks.named("compileTestJava") { dependsOn(generateTestDummies) }
+
 val widenWindowAgentJar = tasks.register<Jar>("widenWindowAgentJar") {
     archiveBaseName.set("widen-window-agent")
     from(sourceSets["widenWindow"].output)

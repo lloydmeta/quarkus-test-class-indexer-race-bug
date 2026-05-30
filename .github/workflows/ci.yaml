@@ -7,17 +7,20 @@ on:
     branches: [ main ]
 
 jobs:
-  # Natural reproduction: 4 parallel forks, no instrumentation. Expected to flake
-  # intermittently on ubuntu-latest because of how slow the runner's IO/CPU is
-  # relative to a developer laptop. Matrix lets us see the flake rate at a glance.
+  # Natural reproduction: 16 parallel forks, well above the typical CI runner
+  # core count (`ubuntu-latest` is 4 vCPU on public repos at time of writing).
+  # Over-subscribing the runner widens the truncate-to-flush window enough for
+  # the race to fire without any instrumentation. This is observed to be flaky
+  # rather than deterministic; the matrix records each attempt's result
+  # independently so we can see the rate.
   flake-rate-natural:
-    name: forks=4 natural (attempt ${{ matrix.attempt }})
+    name: forks=16 natural (attempt ${{ matrix.attempt }})
     runs-on: ubuntu-latest
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        attempt: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ]
+        attempt: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 ]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -25,7 +28,7 @@ jobs:
           java-version: '25'
           distribution: 'temurin'
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew clean test -Pforks=4 --no-daemon
+      - run: ./gradlew clean test -Pforks=16 --no-daemon
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -40,7 +43,7 @@ jobs:
   # surfaces every run; equivalent to running the un-agented build on a slower
   # machine. NOT part of the bug: see src/widenWindow/.../WidenWindowAgent.java.
   flake-rate-widened:
-    name: forks=4 widen-window (attempt ${{ matrix.attempt }})
+    name: forks=16 widen-window (attempt ${{ matrix.attempt }})
     runs-on: ubuntu-latest
     continue-on-error: true
     strategy:
@@ -54,7 +57,7 @@ jobs:
           java-version: '25'
           distribution: 'temurin'
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew clean test -Pforks=4 -Pwiden-window --no-daemon
+      - run: ./gradlew clean test -Pforks=16 -Pwiden-window --no-daemon
       - if: always()
         uses: actions/upload-artifact@v4
         with:

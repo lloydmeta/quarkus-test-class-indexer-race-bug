@@ -4,21 +4,23 @@ Minimal Quarkus + Gradle repro for a write/read race in
 `io.quarkus.test.common.TestClassIndexer` that surfaces as
 `IllegalArgumentException: Not a jandex index` when running tests in parallel.
 
-## TL;DR
+## tl;dr
 
 * `./gradlew clean test -Pforks=1`                     ALWAYS passes (no concurrency, no race)
-* `./gradlew clean test -Pforks=4`                     intermittently fails on slow CI; can pass on a fast laptop
-* `./gradlew clean test -Pforks=4 -Pwiden-window`      reliably fails (deterministic widening of the existing race)
+* `./gradlew clean test -Pforks=16`                    intermittently fails (observed ~40% local flake on a 12-core Apple Silicon laptop, see CI matrix for `ubuntu-latest` rate)
+* `./gradlew clean test -Pforks=16 -Pwiden-window`     reliably fails (deterministic widening of the existing race)
 
-The smoking gun is `forks=1` vs `forks>1`: the project itself is sixteen
-trivial empty `@QuarkusTest` classes spread across four `@TestProfile`s. There
-is nothing in the test code that should care how many JVM forks JUnit runs in.
-The only thing that changes is whether multiple forks share the same
-`build/classes/java/test/test-classes.idx`.
+The smoking gun is `forks=1` vs `forks>1`: the project itself is thirty-two
+trivial empty `@QuarkusTest` classes spread across eight `@TestProfile`s,
+plus 500 generated dummy classes whose only role is to bloat the Jandex index
+file (~180 KB) so the truncate-to-flush window is wider in wall-clock time.
+There is nothing in the test code that should care how many JVM forks JUnit
+runs in. The only thing that changes is whether multiple forks share the
+same `build/classes/java/test/test-classes.idx`.
 
 ## The bug
 
-`io.quarkus.test.common.TestClassIndexer.writeIndex` uses
+[`io.quarkus.test.common.TestClassIndexer.writeIndex`][writeIndex] uses
 `new FileOutputStream(file, false)` to truncate-then-fill the index file:
 
 ```java
@@ -31,9 +33,15 @@ try (FileOutputStream fos = new FileOutputStream(indexPath(testClassLocation).to
 Truncate-then-fill is non-atomic. Between the truncate and the final byte
 written, the file is empty or partially written. With `maxParallelForks > 1`,
 several JVMs share one `build/classes/java/test/` directory and they each call
-`writeIndex` (during `AppMakerHelper`/`FacadeClassLoader` bootstrap, once per
-distinct `@TestProfile`) and `readIndex` (during test class discovery, once per
-test class).
+`writeIndex` once per distinct `@TestProfile` (verified: a `forks=1` run with
+8 profiles emits exactly 8 `writeIndex` calls on `Test worker`; see
+`-Pwiden-window` output, which also reports the resulting index size of
+~180 KB) and `readIndex` once per test class (called from
+[`TestBuildChainFunction.apply`][readIndex-caller] during build chain
+construction, surfaced in the stack trace below).
+
+[writeIndex]: https://github.com/quarkusio/quarkus/blob/3.36.0/test-framework/common/src/main/java/io/quarkus/test/common/TestClassIndexer.java#L52-L60
+[readIndex-caller]: https://github.com/quarkusio/quarkus/blob/3.36.0/test-framework/junit5/src/main/java/io/quarkus/test/junit/TestBuildChainFunction.java
 
 `readIndex` only catches `IOException`:
 
@@ -75,14 +83,14 @@ Caused by: java.lang.IllegalArgumentException: Not a jandex index
 
 ## Why two reproduction modes
 
-On commodity hardware the truncate-to-write window is microseconds. On a busy
-CI runner under contention it widens to dozens of milliseconds and the bug
-fires intermittently (this is how it was first observed in production). To
-make the bug reliably observable on any machine without depending on luck, this
-repo ships an opt-in javaagent (`src/widenWindow/`) that widens the existing
-race window to ~75 ms and forces the index file into the same sparse-hole
-state the multi-writer race produces in production, using only `ftruncate`
-(no explicit byte writes):
+On commodity hardware the truncate-to-write window is in the microsecond range
+when the index is small, but it grows with the index size and the contention
+on the test classes directory. Locally on a 12-core Apple Silicon laptop with
+this repo (8 profiles, 32 tests, ~180 KB index) we see ~40% natural fails at
+`-Pforks=16` (2 of 5 runs, both `IllegalArgumentException: Not a jandex index`).
+Because it's still a probabilistic race, this repo also ships an opt-in
+javaagent (`src/widenWindow/`) that produces the same end-state
+deterministically using only `ftruncate` (no explicit byte writes):
 
 * `RandomAccessFile.setLength(0)` truncates the file (same syscall as
   `FileOutputStream(file, false)`).
@@ -113,21 +121,48 @@ git clone <this repo>
 cd quarkus-test-class-indexer-race-bug
 
 ./gradlew clean test -Pforks=1                  # passes (control)
-./gradlew clean test -Pforks=4                  # may pass on a fast laptop, flaky on CI
-./gradlew clean test -Pforks=4 -Pwiden-window   # reliably fails with "Not a jandex index"
+./gradlew clean test -Pforks=16                 # natural race; flaky (over-subscribed forks)
+./gradlew clean test -Pforks=16 -Pwiden-window  # reliably fails with "Not a jandex index"
 ```
 
-`-Pforks=N` sets `maxParallelForks` on the `Test` task. Default is
+`-Pforks=N` sets `maxParallelForks` on the `Test` task. `forks=16` is enough
+to over-subscribe a typical CI runner (`ubuntu-latest` is 4 vCPU on public
+repos at time of writing, see [the GitHub-hosted runners reference][gh-runners])
+and most developer laptops, which widens the truncate-to-flush window past
+the race threshold. The default if `-Pforks` is omitted is
 `gradle.startParameter.maxWorkerCount`, which mirrors how many real projects
 configure it.
 
+[gh-runners]: https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+
 CI runs all three matrices on `ubuntu-latest`: see `.github/workflows/ci.yaml`.
+Note: the `forks=16 natural` and `forks=16 widen-window` matrices use
+`continue-on-error: true` so each attempt's pass/fail is recorded
+independently. The Actions UI summary shows them as soft-pass with annotations;
+expand the matrix to see actual per-attempt results.
+
+### About `maxParallelForks`
+
+Gradle's [Test task documentation][gradle-max-parallel-forks] documents
+`maxParallelForks` as the standard knob for parallel test execution and
+explicitly warns about the relevant failure mode:
+
+> When using parallel test execution, make sure your tests are properly
+> isolated from one another. Tests that interact with the filesystem are
+> particularly prone to conflict, causing intermittent test failures.
+
+The user-visible tests in this repro don't touch the filesystem; the
+filesystem conflict is entirely inside Quarkus's `TestClassIndexer`.
+
+[gradle-max-parallel-forks]: https://docs.gradle.org/current/userguide/java_testing.html#test_execution
 
 ## Expected vs actual
 
-Expected: `writeIndex`/`readIndex` are concurrency-safe, since Gradle's
-`maxParallelForks > 1` is the documented and recommended way to speed up
-`@QuarkusTest` suites.
+Expected: `writeIndex`/`readIndex` either tolerate concurrent access or
+fail in a recoverable way. `maxParallelForks > 1` is a documented Gradle
+`Test` task property (see "About `maxParallelForks`" above), and the same
+race also fires whenever two Gradle builds touch the same checkout
+(CI matrix re-runs, IDE auto-run alongside `./gradlew test`, etc.).
 
 Actual: with multiple forks sharing one test classes directory, `writeIndex`
 truncate-then-fill races `readIndex`'s magic check, and the `IllegalArgumentException`
@@ -137,12 +172,22 @@ escapes `readIndex`'s narrow `IOException` catch, killing the test worker.
 
 A few options come to mind:
 
-* `writeIndex` could write atomically: either write the full index to a temp
-file in the same directory and `Files.move(..., ATOMIC_MOVE)` it into place,
-or hold an OS file lock across the whole write.
-* Maybe in combination with ^, `readIndex` could also catch `IllegalArgumentException`
-from `IndexReader` and fall back to `indexTestClasses(testClass)` the same way it
-does for `IOException`.
+* `writeIndex` could write atomically: write the full index to a temp file in
+the same directory and `Files.move(..., ATOMIC_MOVE)` it into place
+([`Files.move` ATOMIC_MOVE docs][atomic-move]; same-filesystem rename, which
+is the case here since the temp file is in the same directory). Or hold an OS
+file lock across the whole write.
+* As defence-in-depth alongside the above, `readIndex` could also catch
+`IllegalArgumentException` from `IndexReader` and fall back to
+`indexTestClasses(testClass)` the same way it does for `IOException`. (This
+alone is a band-aid, not a fix, but it would prevent the confusing
+`FacadeClassLoader` failure mode while the underlying race exists.)
+
+`removeIndex` (which deletes the index file) is similarly unsynchronised; it's
+not part of this failure mode but might be worth eyeballing as part of any
+fix.
+
+[atomic-move]: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/StandardCopyOption.html#ATOMIC_MOVE
 
 
 ## Versions
