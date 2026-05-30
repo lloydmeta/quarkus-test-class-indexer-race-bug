@@ -47,7 +47,7 @@ tasks.withType<JavaCompile> {
 // time. Plain POJOs with a handful of methods/fields/annotations each: enough
 // to give Jandex a non-trivial per-class entry without introducing any CDI/ARC
 // machinery that Quarkus would react to.
-val dummyCount = (project.findProperty("dummies") as String?)?.toInt() ?: 500
+val dummyCount = (project.findProperty("dummies") as String?)?.toInt() ?: 5000
 
 val generateTestDummies = tasks.register("generateTestDummies") {
     val outDir = layout.buildDirectory.dir("generated-sources/test-dummies/java/com/beachape/dummies")

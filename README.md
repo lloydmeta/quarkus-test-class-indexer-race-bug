@@ -12,7 +12,7 @@ Minimal Quarkus + Gradle repro for a write/read race in
 
 The smoking gun is `forks=1` vs `forks>1`: the project itself is thirty-two
 trivial empty `@QuarkusTest` classes spread across eight `@TestProfile`s,
-plus 500 generated dummy classes whose only role is to bloat the Jandex index
+plus 5000 generated dummy classes whose only role is to bloat the Jandex index
 file (~180 KB) so the truncate-to-flush window is wider in wall-clock time.
 There is nothing in the test code that should care how many JVM forks JUnit
 runs in. The only thing that changes is whether multiple forks share the
