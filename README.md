@@ -10,8 +10,8 @@ Minimal Quarkus + Gradle repro for a write/read race in
 * `./gradlew clean test -Pforks=4`                     intermittently fails on slow CI; can pass on a fast laptop
 * `./gradlew clean test -Pforks=4 -Pwiden-window`      reliably fails (deterministic widening of the existing race)
 
-The smoking gun is `forks=1` vs `forks>1`: the project itself is a handful of
-trivial `@QuarkusTest` classes against `@TestProfile`s that hit `/hello`. There
+The smoking gun is `forks=1` vs `forks>1`: the project itself is sixteen
+trivial empty `@QuarkusTest` classes spread across four `@TestProfile`s. There
 is nothing in the test code that should care how many JVM forks JUnit runs in.
 The only thing that changes is whether multiple forks share the same
 `build/classes/java/test/test-classes.idx`.
@@ -80,13 +80,26 @@ CI runner under contention it widens to dozens of milliseconds and the bug
 fires intermittently (this is how it was first observed in production). To
 make the bug reliably observable on any machine without depending on luck, this
 repo ships an opt-in javaagent (`src/widenWindow/`) that widens the existing
-race window from microseconds to ~75 ms (with jitter) by writing 4 non-magic
-bytes to the index file at the entry of `writeIndex` before the original
-`writeIndex` runs to completion.
+race window to ~75 ms and forces the index file into the same sparse-hole
+state the multi-writer race produces in production, using only `ftruncate`
+(no explicit byte writes):
 
-The agent does not introduce a bug. It simulates the same partial-write state
-the real race produces and lets the existing concurrent reader hit it
-deterministically. The smoking gun is still `-Pforks=1` always passing.
+* `RandomAccessFile.setLength(0)` truncates the file (same syscall as
+  `FileOutputStream(file, false)`).
+* `RandomAccessFile.setLength(8)` extends the file back to 8 bytes, which the
+  kernel implements as a sparse hole. Reads of the leading bytes return
+  zeros without anything having been written.
+* The agent then sleeps ~75 ms and lets the original `writeIndex` run to
+  completion.
+
+This is the same end state POSIX produces when fork A truncates the index
+while fork B has an open `FileOutputStream` past offset N and continues
+writing: the file ends up with size = N+M and bytes 0..N-1 as sparse zeros
+that fail Jandex's magic check.
+
+The agent does not introduce a bug. It uses standard `ftruncate` semantics to
+deterministically produce the partial-state the race exposes incidentally on
+slow hardware. The smoking gun is still `-Pforks=1` always passing.
 
 See `src/widenWindow/java/com/beachape/widen/WidenWindowAgent.java` for the
 full source and rationale.
@@ -122,11 +135,15 @@ escapes `readIndex`'s narrow `IOException` catch, killing the test worker.
 
 ## Suggested fix
 
-`writeIndex` should write atomically: either write the full index to a temp
+A few options come to mind:
+
+* `writeIndex` could write atomically: either write the full index to a temp
 file in the same directory and `Files.move(..., ATOMIC_MOVE)` it into place,
-or hold an OS file lock across the whole write. Belt-and-braces, `readIndex`
-should also catch `IllegalArgumentException` from `IndexReader` and fall back
-to `indexTestClasses(testClass)` the same way it does for `IOException`.
+or hold an OS file lock across the whole write.
+* Maybe in combination with ^, `readIndex` could also catch `IllegalArgumentException`
+from `IndexReader` and fall back to `indexTestClasses(testClass)` the same way it
+does for `IOException`.
+
 
 ## Versions
 

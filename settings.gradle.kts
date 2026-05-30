@@ -1,10 +1,1 @@
-pluginManagement {
-    val quarkusPluginVersion: String by settings
-    val quarkusPluginId: String by settings
-    repositories {
-        mavenCentral()
-        gradlePluginPortal()
-        mavenLocal()
-    }
-}
-rootProject.name="quarkus-test-class-indexer-race-bug"
+rootProject.name = "quarkus-test-class-indexer-race-bug"
