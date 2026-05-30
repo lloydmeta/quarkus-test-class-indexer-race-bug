@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # Natural reproduction: 4 parallel forks, no instrumentation. Expected to flake
+  # intermittently on ubuntu-latest because of how slow the runner's IO/CPU is
+  # relative to a developer laptop. Matrix lets us see the flake rate at a glance.
+  flake-rate-natural:
+    name: forks=4 natural (attempt ${{ matrix.attempt }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew clean test -Pforks=4 --no-daemon
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: natural-attempt${{ matrix.attempt }}
+          path: |
+            build/reports/tests/
+            build/test-results/
+          retention-days: 14
+
+  # Reliable reproduction: same project + the widen-window javaagent. The agent
+  # widens the existing race window from microseconds to ~75 ms so the bug
+  # surfaces every run; equivalent to running the un-agented build on a slower
+  # machine. NOT part of the bug: see src/widenWindow/.../WidenWindowAgent.java.
+  flake-rate-widened:
+    name: forks=4 widen-window (attempt ${{ matrix.attempt }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [ 1, 2, 3 ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew clean test -Pforks=4 -Pwiden-window --no-daemon
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: widened-attempt${{ matrix.attempt }}
+          path: |
+            build/reports/tests/
+            build/test-results/
+          retention-days: 14
+
+  # Control: same project, single fork. Must always pass. This is the smoking
+  # gun that the failures above are a concurrency bug in writeIndex/readIndex
+  # rather than a logic error in the tests themselves.
+  passes-with-single-fork:
+    name: forks=1 (control, must pass)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew clean test -Pforks=1 --no-daemon
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: control-forks1
+          path: |
+            build/reports/tests/
+            build/test-results/
+          retention-days: 14
