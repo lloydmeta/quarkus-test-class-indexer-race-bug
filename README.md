@@ -99,7 +99,7 @@ Apple Silicon laptop, all at `-Pforks=16`, varying `-Pdummies`:
 The bug is the same regardless of suite size; the dummies just shift the
 probability from "weeks of CI" to "minutes of laptop time". On suites with
 small index files the natural rate may be effectively zero on commodity
-hardware, which is one reason this kind of bug can sit in production for a
+hardware, which is one reason this kind of bug can sit in `main` for a
 long time before anyone notices. Because the natural reproduction is still
 probabilistic, this repo also ships an opt-in javaagent (`src/widenWindow/`)
 that produces the same end-state deterministically using only `ftruncate`
