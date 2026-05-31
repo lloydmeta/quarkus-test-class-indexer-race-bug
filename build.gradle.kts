@@ -12,13 +12,21 @@ repositories {
 // TestClassIndexer.writeIndex race window from microseconds to ~75 ms so the
 // race is reliably observable locally. NOT part of the bug. Opt-in via
 // `-Pwiden-window`. See README and src/widenWindow/.../WidenWindowAgent.java.
+//
+// Always-on fix-agent source set: patches TestClassIndexer.writeIndex (atomic
+// temp + ATOMIC_MOVE) and TestClassIndexer.readIndex (IAE-tolerant fallback).
+// Loaded unconditionally on every Test JVM. See src/fixAgent/.../FixAgent.java.
 sourceSets {
     create("widenWindow") {
         java.setSrcDirs(listOf("src/widenWindow/java"))
     }
+    create("fixAgent") {
+        java.setSrcDirs(listOf("src/fixAgent/java"))
+    }
 }
 
 val widenWindowImplementation by configurations.getting
+val fixAgentImplementation by configurations.getting
 
 dependencies {
     implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.36.0"))
@@ -27,6 +35,11 @@ dependencies {
 
     widenWindowImplementation("net.bytebuddy:byte-buddy:1.18.8")
     widenWindowImplementation("net.bytebuddy:byte-buddy-agent:1.18.8")
+
+    fixAgentImplementation("net.bytebuddy:byte-buddy:1.18.8")
+    fixAgentImplementation("net.bytebuddy:byte-buddy-agent:1.18.8")
+    fixAgentImplementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.36.0"))
+    fixAgentImplementation("io.quarkus:quarkus-test-common")
 }
 
 group = "com.beachape"
@@ -106,6 +119,32 @@ val widenWindowAgentJar = tasks.register<Jar>("widenWindowAgentJar") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
+val fixAgentJar = tasks.register<Jar>("fixAgentJar") {
+    archiveBaseName.set("fix-agent")
+    from(sourceSets["fixAgent"].output)
+    from({
+        configurations["fixAgentRuntimeClasspath"].map {
+            if (it.isDirectory) it else zipTree(it)
+        }
+    }) {
+        exclude(
+            "META-INF/MANIFEST.MF",
+            "META-INF/*.SF",
+            "META-INF/*.DSA",
+            "META-INF/*.RSA",
+            "module-info.class",
+        )
+    }
+    manifest {
+        attributes(
+            "Premain-Class" to "com.beachape.fix.FixAgent",
+            "Can-Redefine-Classes" to "true",
+            "Can-Retransform-Classes" to "true",
+        )
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
 tasks.withType<Test> {
     useJUnitPlatform()
     // Tunable from CLI: ./gradlew test -Pforks=4
@@ -117,11 +156,27 @@ tasks.withType<Test> {
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
 
+    // Always attach the fix-agent. When -Pwiden-window is also set, list
+    // widen FIRST so the fix transformer is the last to touch the class
+    // bytes; fix's @Advice.OnMethodEnter then ends up at the very top of
+    // writeIndex and (via skipOn) bypasses widen's onEnter at runtime. With
+    // the atomic write in place, widen's chosen failure mode (a sparse hole
+    // in the target file) cannot occur on disk.
+    dependsOn(fixAgentJar)
+    val fixAgentPath = fixAgentJar.get().archiveFile.get().asFile.absolutePath
     if (project.hasProperty("widen-window")) {
         dependsOn(widenWindowAgentJar)
-        val agentJarPath = widenWindowAgentJar.get().archiveFile.get().asFile.absolutePath
-        jvmArgumentProviders.add(
-            CommandLineArgumentProvider { listOf("-javaagent:$agentJarPath") }
-        )
     }
+    val widenAgentPath =
+        if (project.hasProperty("widen-window"))
+            widenWindowAgentJar.get().archiveFile.get().asFile.absolutePath
+        else null
+    jvmArgumentProviders.add(
+        CommandLineArgumentProvider {
+            buildList {
+                if (widenAgentPath != null) add("-javaagent:$widenAgentPath")
+                add("-javaagent:$fixAgentPath")
+            }
+        }
+    )
 }
