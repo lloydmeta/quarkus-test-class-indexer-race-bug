@@ -21,7 +21,7 @@ sourceSets {
 val widenWindowImplementation by configurations.getting
 
 dependencies {
-    implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.36.0"))
+    implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.36.1"))
     implementation("io.quarkus:quarkus-arc")
     testImplementation("io.quarkus:quarkus-junit5")
 
