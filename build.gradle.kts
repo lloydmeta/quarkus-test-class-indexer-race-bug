@@ -25,8 +25,8 @@ dependencies {
     implementation("io.quarkus:quarkus-arc")
     testImplementation("io.quarkus:quarkus-junit5")
 
-    widenWindowImplementation("net.bytebuddy:byte-buddy:1.18.8")
-    widenWindowImplementation("net.bytebuddy:byte-buddy-agent:1.18.8")
+    widenWindowImplementation("net.bytebuddy:byte-buddy:1.18.10")
+    widenWindowImplementation("net.bytebuddy:byte-buddy-agent:1.18.10")
 }
 
 group = "com.beachape"
