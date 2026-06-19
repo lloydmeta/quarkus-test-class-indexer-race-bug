@@ -8,7 +8,6 @@ Minimal Quarkus + Gradle repro for a write/read race in
 
 * `./gradlew clean test -Pforks=1`                     ALWAYS passes (no concurrency, no race)
 * `./gradlew clean test -Pforks=16`                    flaky (observed 9 of 10 runs failing on a 12-core Apple Silicon laptop; see CI matrix for `ubuntu-latest` rate)
-* `./gradlew clean test -Pforks=16 -Pwiden-window`     reliably fails (deterministic widening of the existing race)
 
 The smoking gun is `forks=1` vs `forks>1`: the project itself is thirty-two
 trivial empty `@QuarkusTest` classes spread across eight `@TestProfile`s,
@@ -36,9 +35,8 @@ Truncate-then-fill is non-atomic. Between the truncate and the final byte
 written, the file is empty or partially written. With `maxParallelForks > 1`,
 several JVMs share one `build/classes/java/test/` directory and they each call
 `writeIndex` once per distinct `@TestProfile` (verified: a `forks=1` run with
-8 profiles emits exactly 8 `writeIndex` calls on `Test worker`; see
-`-Pwiden-window` output, which also reports the resulting index size of
-~1.9 MB) and `readIndex` once per test class (called from
+8 profiles emits exactly 8 `writeIndex` calls on `Test worker`, 
+which also reports the resulting index size of ~1.9 MB) and `readIndex` once per test class (called from
 [`TestBuildChainFunction.apply`][readIndex-caller] during build chain
 construction, surfaced in the stack trace below).
 
@@ -83,48 +81,6 @@ Caused by: java.lang.IllegalArgumentException: Not a jandex index
     ...
 ```
 
-## Why two reproduction modes
-
-The truncate-to-write window is in the microsecond range when the index is
-small, but it grows roughly linearly with index size. Local sweep on a 12-core
-Apple Silicon laptop, all at `-Pforks=16`, varying `-Pdummies`:
-
-| `-Pdummies` | Index size  | Flake rate     |
-|-------------|-------------|----------------|
-| 0           | 2.8 KB      | 0/5  (0%)      |
-| 500         | 178 KB      | 0/5  (0%)      |
-| 2000        | 740 KB      | 3/5  (60%)     |
-| 5000        | 1.9 MB      | 9/10 (90%)     |
-
-The bug is the same regardless of suite size; the dummies just shift the
-probability from "weeks of CI" to "minutes of laptop time". On suites with
-small index files the natural rate may be effectively zero on commodity
-hardware, which is one reason this kind of bug can sit in `main` for a
-long time before anyone notices. Because the natural reproduction is still
-probabilistic, this repo also ships an opt-in javaagent (`src/widenWindow/`)
-that produces the same end-state deterministically using only `ftruncate`
-(no explicit byte writes):
-
-* `RandomAccessFile.setLength(0)` truncates the file (same syscall as
-  `FileOutputStream(file, false)`).
-* `RandomAccessFile.setLength(8)` extends the file back to 8 bytes, which the
-  kernel implements as a sparse hole. Reads of the leading bytes return
-  zeros without anything having been written.
-* The agent then sleeps ~75 ms and lets the original `writeIndex` run to
-  completion.
-
-This is the same end state POSIX produces when fork A truncates the index
-while fork B has an open `FileOutputStream` past offset N and continues
-writing: the file ends up with size = N+M and bytes 0..N-1 as sparse zeros
-that fail Jandex's magic check.
-
-The agent does not introduce a bug. It uses standard `ftruncate` semantics to
-deterministically produce the partial-state the race exposes incidentally on
-slow hardware. The smoking gun is still `-Pforks=1` always passing.
-
-See `src/widenWindow/java/com/beachape/widen/WidenWindowAgent.java` for the
-full source and rationale.
-
 ## Repro
 
 Requires JDK 25.
@@ -135,7 +91,6 @@ cd quarkus-test-class-indexer-race-bug
 
 ./gradlew clean test -Pforks=1                  # passes (control)
 ./gradlew clean test -Pforks=16                 # natural race; flaky (over-subscribed forks)
-./gradlew clean test -Pforks=16 -Pwiden-window  # reliably fails with "Not a jandex index"
 ```
 
 `-Pforks=N` sets `maxParallelForks` on the `Test` task. `forks=16` is enough
@@ -155,11 +110,8 @@ my hardware".
 
 [gh-runners]: https://docs.github.com/en/actions/reference/runners/github-hosted-runners
 
-CI runs all three matrices on `ubuntu-latest`: see `.github/workflows/ci.yaml`.
-Note: the `forks=16 natural` and `forks=16 widen-window` matrices use
-`continue-on-error: true` so each attempt's pass/fail is recorded
-independently. The Actions UI summary shows them as soft-pass with annotations;
-expand the matrix to see actual per-attempt results.
+CI runs all matrices on `ubuntu-latest`: see `.github/workflows/ci.yaml`. 
+so each attempt's pass/fail is recorded independently. 
 
 ### About `maxParallelForks`
 
